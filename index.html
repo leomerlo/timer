@@ -19,7 +19,7 @@
     font-family: ui-rounded, -apple-system, system-ui, sans-serif;
     user-select: none; -webkit-user-select: none;
     -webkit-tap-highlight-color: transparent;
-    touch-action: manipulation;
+    touch-action: none;
   }
   canvas { position: fixed; inset: 0; width: 100%; height: 100%; z-index: -1; }
   /* Invisible: only lends its box, weight and font to the dot digits (and stays readable to screen readers). */
@@ -78,8 +78,11 @@ function reset() { endAt = null; remaining = TOTAL; pulses = 0; unlock(); render
 
 // One tap starts/pauses (the digits blink to confirm). Three quick taps reset and light up every
 // dot; the first two taps of the triple toggle and toggle back, so they cancel out.
+// pointerup, not click: iOS Safari fires no click for taps on non-interactive elements, and
+// pointerup (unlike pointerdown) counts as a user gesture for wake lock / fullscreen on touch.
 let taps = 0, lastTap = 0, tapAt = -1e9;
-addEventListener('click', () => {
+addEventListener('pointerup', e => {
+  if (e.button !== 0) return;
   const now = Date.now();
   taps = now - lastTap < 400 ? taps + 1 : 1; lastTap = now;
   if (taps === 3) { reset(); pulseAt = now; taps = 0; }
@@ -91,14 +94,14 @@ addEventListener('keydown', e => {
 });
 
 // --- dot grid: procedural flow field; every pulse lights all dots, then flow resumes ---
-let W, H, cols, rows, S, UW, UH, mask, maskKey = '';
+let W, H, cols, rows, mask, maskKey = '';
 const mk = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
 
 function resize() {
   const dpr = devicePixelRatio || 1, r = cv.getBoundingClientRect();
   W = cv.width = Math.round(r.width * dpr); H = cv.height = Math.round(r.height * dpr);
-  cols = Math.max(1, Math.round(r.width / 22)); rows = Math.max(1, Math.round(r.height / 22));
-  S = r.width / cols / 22; UW = cols * S; UH = rows * S;
+  const pitch = Math.min(r.width, r.height) / 18;       // the grid follows the screen: 18 dots on the short side
+  cols = Math.max(1, Math.round(r.width / pitch)); rows = Math.max(1, Math.round(r.height / pitch));
   maskKey = '';
 }
 addEventListener('resize', resize); resize();
@@ -131,7 +134,7 @@ function buildMask(key) {
 }
 
 // --- flow algorithms (auto blends them all; ?algo=name pins one) ---
-// x, y come in units of 22 CSS px so each pattern keeps its scale whatever the dot pitch. All return 0..1.
+// x, y come in dots, so every pattern scales with the grid. All return 0..1.
 const c01 = v => v < 0 ? 0 : v > 1 ? 1 : v;
 const ss = (a, b, v) => (v = c01((v - a) / (b - a)), v * v * (3 - 2 * v));
 
@@ -157,19 +160,19 @@ const fbm = (x, y, z) => noise(x, y, z) + 0.5 * noise(2 * x, 2 * y, 2 * z) + 0.2
 // 5 points wandering on Lissajous paths (used by gotas / metaballs), moved once per frame.
 let SRC = [];
 const moveSources = t => SRC = [0, 1, 2, 3, 4].map(k => [
-  UW * (0.5 + 0.42 * Math.sin(t * (0.11 + 0.04 * k) + k * 1.7)), UH * (0.5 + 0.42 * Math.sin(t * (0.09 + 0.03 * k) + k * 2.9))]);
+  cols * (0.5 + 0.42 * Math.sin(t * (0.11 + 0.04 * k) + k * 1.7)), rows * (0.5 + 0.42 * Math.sin(t * (0.09 + 0.03 * k) + k * 2.9))]);
 
 // Particles steered by a noise field, drifting right, each leaving a fading trail on the dot it crosses.
 let trail = new Float32Array(0), parts = [];
 function stepTrails(t, dt) {
-  if (trail.length !== cols * rows) { trail = new Float32Array(cols * rows); parts = Array.from({ length: 300 }, () => [Math.random() * UW, Math.random() * UH]); }
+  if (trail.length !== cols * rows) { trail = new Float32Array(cols * rows); parts = Array.from({ length: 300 }, () => [Math.random() * cols, Math.random() * rows]); }
   const f = dt * 60, decay = 0.95 ** f;
   for (let k = 0; k < trail.length; k++) trail[k] *= decay;
   for (const p of parts) {
     const a = noise(p[0] * 0.1, p[1] * 0.1, t * 0.05) * Math.PI * 3;
     p[0] += (Math.cos(a) * 0.08 + 0.03) * f; p[1] += Math.sin(a) * 0.08 * f;
-    if (p[0] < 0 || p[0] >= UW || p[1] < 0 || p[1] >= UH || Math.random() < 0.002 * f) { p[0] = Math.random() * UW; p[1] = Math.random() * UH; }
-    trail[(p[1] / S | 0) * cols + (p[0] / S | 0)] += 0.3 * f;
+    if (p[0] < 0 || p[0] >= cols || p[1] < 0 || p[1] >= rows || Math.random() < 0.002 * f) { p[0] = Math.random() * cols; p[1] = Math.random() * rows; }
+    trail[(p[1] | 0) * cols + (p[0] | 0)] += 0.3 * f;
   }
 }
 
@@ -232,12 +235,12 @@ function frame(now) {
       const idx = j * cols + i, m = mask[idx];
       if ((m > 0.2) !== digit) continue;
       let f = 0;
-      for (const [fn, w] of mix) f += w * fn(i * S, j * S, t, idx);
+      for (const [fn, w] of mix) f += w * fn(i, j, t, idx);
       // digits flow between 70% and full (scaled by glyph coverage), the rest flows dim
       const v = digit ? m * (0.7 + 0.3 * f) : 0.5 * f;
       // digit hue sweeps the whole spectrum: a full turn every 60 s, a rainbow drift across
       // the screen, and the flow field bending it locally
-      if (digit) ctx.fillStyle = `hsl(${(t * 6 + i * S * 4 + f * 90) % 360 | 0} 75% 68%)`;
+      if (digit) ctx.fillStyle = `hsl(${(t * 6 + i * 4 + f * 90) % 360 | 0} 75% 68%)`;
       const k = v + (1 - v) * (digit ? blink : pulse);
       ctx.globalAlpha = 0.1 + 0.9 * k * k;
       ctx.beginPath();
