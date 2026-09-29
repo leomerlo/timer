@@ -9,14 +9,12 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>Flow Timer</title>
 <style>
-  :root { --green: #8ad98e; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html { background: #000; }
   html, body { height: 100%; color: #fff; overflow: hidden; }
   body {
     height: 100dvh;
     display: grid;
-    grid-template-rows: minmax(0, 1fr) auto;
     padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
     font-family: ui-rounded, -apple-system, system-ui, sans-serif;
     user-select: none; -webkit-user-select: none;
@@ -26,31 +24,15 @@
   canvas { position: fixed; inset: 0; width: 100%; height: 100%; z-index: -1; }
   /* Invisible: only lends its box, weight and font to the dot digits (and stays readable to screen readers). */
   #time { color: transparent; font-weight: 600; }
-  #controls { display: flex; justify-content: center; gap: 8px; padding-bottom: 4vh; }
-  button {
-    width: 110px; min-height: 44px; border: 0; border-radius: 999px;
-    background: rgb(28 28 30 / .7);
-    -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
-    color: #fff; font: inherit; font-size: 15px; font-weight: 600;
-    cursor: pointer;
-  }
-  button:active { background: rgb(58 58 60 / .85); }
 </style>
 </head>
 <body>
 <canvas id="dots"></canvas>
-<div id="time">2:00</div>
-<div id="controls">
-  <button id="start">Iniciar</button>
-  <button id="pause">Pausar</button>
-  <button id="reset">Reset</button>
-  <button id="algo"></button>
-</div>
+<div id="time" role="timer">2:00</div>
 <script>
 const TOTAL = 120_000, PULSE = 30_000;
 const $ = id => document.getElementById(id);
 const timeEl = $('time'), cv = $('dots'), ctx = cv.getContext('2d');
-const GREEN = getComputedStyle(document.documentElement).getPropertyValue('--green').trim();
 
 // --- timer: wall-clock based, so it stays exact while rAF is paused or the phone sleeps ---
 let remaining = TOTAL, endAt = null, pulses = 0, pulseAt = -1e9, wakeLock = null;
@@ -80,26 +62,36 @@ async function lock() {
 function unlock() { wakeLock?.release(); wakeLock = null; }
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && endAt) lock(); });
 
-$('start').onclick = () => {
-  if (endAt) return;
+function start() {
   if (remaining === 0) { remaining = TOTAL; pulses = 0; }
   endAt = Date.now() + remaining;
   lock();
   document.documentElement.requestFullscreen?.()?.catch(() => {});
-};
-$('pause').onclick = () => {
+}
+function pause() {
   const now = Date.now();
   tick(now);                                  // a timer that just hit 0:00 finishes instead of freezing
   if (!endAt) return;
   remaining = left(now); endAt = null; unlock(); render(now);
-};
-$('reset').onclick = () => {
-  endAt = null; remaining = TOTAL; pulses = 0; unlock(); render(Date.now());
-};
-document.addEventListener('touchstart', () => {}, { passive: true });   // iOS only paints :active with a touch listener
+}
+function reset() { endAt = null; remaining = TOTAL; pulses = 0; unlock(); render(Date.now()); }
+
+// One tap starts/pauses (the digits blink to confirm). Three quick taps reset and light up every
+// dot; the first two taps of the triple toggle and toggle back, so they cancel out.
+let taps = 0, lastTap = 0, tapAt = -1e9;
+addEventListener('click', () => {
+  const now = Date.now();
+  taps = now - lastTap < 400 ? taps + 1 : 1; lastTap = now;
+  if (taps === 3) { reset(); pulseAt = now; taps = 0; }
+  else { endAt ? pause() : start(); tapAt = now; }
+});
+addEventListener('keydown', e => {
+  if (e.key === ' ' || e.key === 'Enter') endAt ? pause() : start();
+  else if (e.key === 'r' || e.key === 'Escape') reset();
+});
 
 // --- dot grid: procedural flow field; every pulse lights all dots, then flow resumes ---
-let W, H, cols, rows, S, UW, UH, mask, maskTxt = '';
+let W, H, cols, rows, S, UW, UH, mask, maskKey = '';
 const mk = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
 
 function resize() {
@@ -107,16 +99,19 @@ function resize() {
   W = cv.width = Math.round(r.width * dpr); H = cv.height = Math.round(r.height * dpr);
   cols = Math.max(1, Math.round(r.width / 22)); rows = Math.max(1, Math.round(r.height / 22));
   S = r.width / cols / 22; UW = cols * S; UH = rows * S;
-  maskTxt = '';
+  maskKey = '';
 }
 addEventListener('resize', resize); resize();
 
-// Rasterise the digits at one pixel per dot: each pixel's antialiased alpha is how much
-// of that dot's cell the glyphs cover. Digits get fixed-width slots so nothing jiggles.
-function buildMask(txt) {
+// Rasterise the digits at SS×SS pixels per dot and average each block: `mask` then holds how much
+// of every dot's cell the glyphs cover (0..1). Drawing text at one pixel per dot came out uneven
+// on iOS, hence the supersampling. Digits get fixed-width slots so nothing jiggles.
+const SS = 6;
+function buildMask(key) {
+  const txt = timeEl.textContent, mw = cols * SS, mh = rows * SS;
   const r = cv.getBoundingClientRect(), t = timeEl.getBoundingClientRect(), cs = getComputedStyle(timeEl);
-  mk.canvas.width = cols; mk.canvas.height = rows;
-  mk.setTransform(cols / r.width, 0, 0, rows / r.height, 0, 0);   // draw in CSS px
+  mk.canvas.width = mw; mk.canvas.height = mh;
+  mk.setTransform(mw / r.width, 0, 0, mh / r.height, 0, 0);   // draw in CSS px
   mk.font = `${cs.fontWeight} 100px ${cs.fontFamily}`;
   const dw = Math.max(...[...'0123456789'].map(d => mk.measureText(d).width));
   const colon = mk.measureText(':').width, cap = mk.measureText('0').actualBoundingBoxAscent;
@@ -128,11 +123,14 @@ function buildMask(txt) {
   let x = t.left - r.left + (t.width - w * s) / 2;
   const y = t.top - r.top + (t.height + cap * s) / 2;
   for (const c of txt) { mk.fillText(c, x + slot(c) * s / 2, y); x += slot(c) * s; }
-  mask = mk.getImageData(0, 0, cols, rows).data;
-  maskTxt = txt;
+  const px = mk.getImageData(0, 0, mw, mh).data;
+  mask = new Float32Array(cols * rows);
+  for (let y = 0; y < mh; y++) for (let x = 0; x < mw; x++)
+    mask[(y / SS | 0) * cols + (x / SS | 0)] += px[(y * mw + x) * 4 + 3] / (255 * SS * SS);
+  maskKey = key;
 }
 
-// --- flow algorithms (the ✦ button cycles auto / each one, ?algo=name pins one) ---
+// --- flow algorithms (auto blends them all; ?algo=name pins one) ---
 // x, y come in units of 22 CSS px so each pattern keeps its scale whatever the dot pitch. All return 0..1.
 const c01 = v => v < 0 ? 0 : v > 1 ? 1 : v;
 const ss = (a, b, v) => (v = c01((v - a) / (b - a)), v * v * (3 - 2 * v));
@@ -199,9 +197,6 @@ const ALGOS = {
 const names = Object.keys(ALGOS), modes = ['auto', ...names];
 let algo = new URLSearchParams(location.search).get('algo');
 if (!modes.includes(algo)) algo = 'auto';
-const showAlgo = () => $('algo').textContent = `✦ ${algo}`;
-$('algo').onclick = () => { algo = modes[(modes.indexOf(algo) + 1) % modes.length]; showAlgo(); };
-showAlgo();
 
 // auto: a gaussian window slides along the (circular) algorithm list, one step every 30 s. Each
 // algorithm weighs exp(-d²/2σ²) by its distance d to the window centre, so one holds ~20 s and
@@ -222,8 +217,9 @@ let last = 0;
 function frame(now) {
   const wall = Date.now();
   tick(wall);
-  if (maskTxt !== timeEl.textContent) buildMask(timeEl.textContent);
+  if (maskKey !== timeEl.textContent) buildMask(timeEl.textContent);
   const t = now / 1000, dt = Math.min(0.1, (now - last) / 1000), pulse = Math.max(0, 1 - (wall - pulseAt) / 1000) ** 2;
+  const blink = Math.max(pulse, Math.max(0, 1 - (wall - tapAt) / 400) ** 2);   // digits also answer a tap
   last = now;
   moveSources(t);
   stepTrails(t, dt);                       // always, so trails are ready when estelas fades in
@@ -231,15 +227,18 @@ function frame(now) {
   const cw = W / cols, ch = H / rows, maxR = Math.min(cw, ch) * 0.22;
   ctx.clearRect(0, 0, W, H);
   for (const digit of [false, true]) {
-    ctx.fillStyle = digit ? GREEN : '#fff';
+    ctx.fillStyle = '#fff';
     for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) {
-      const m = mask[(j * cols + i) * 4 + 3] / 255;
+      const idx = j * cols + i, m = mask[idx];
       if ((m > 0.2) !== digit) continue;
-      // digit dots flow too, between half and full, scaled by glyph coverage; the rest flow dimmer
       let f = 0;
-      for (const [fn, w] of mix) f += w * fn(i * S, j * S, t, j * cols + i);
-      const v = digit ? m * (0.5 + 0.5 * f) : 0.5 * f;
-      const k = v + (1 - v) * pulse;
+      for (const [fn, w] of mix) f += w * fn(i * S, j * S, t, idx);
+      // digits flow between 70% and full (scaled by glyph coverage), the rest flows dim
+      const v = digit ? m * (0.7 + 0.3 * f) : 0.5 * f;
+      // digit hue sweeps the whole spectrum: a full turn every 60 s, a rainbow drift across
+      // the screen, and the flow field bending it locally
+      if (digit) ctx.fillStyle = `hsl(${(t * 6 + i * S * 4 + f * 90) % 360 | 0} 75% 68%)`;
+      const k = v + (1 - v) * (digit ? blink : pulse);
       ctx.globalAlpha = 0.1 + 0.9 * k * k;
       ctx.beginPath();
       ctx.arc(cw * (i + .5), ch * (j + .5), maxR * (0.2 + 0.8 * k), 0, Math.PI * 2);
