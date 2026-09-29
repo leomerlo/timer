@@ -22,8 +22,8 @@
     touch-action: none;
   }
   canvas { position: fixed; inset: 0; width: 100%; height: 100%; z-index: -1; }
-  /* Invisible: only lends its box, weight and font to the dot digits (and stays readable to screen readers). */
-  #time { color: transparent; font-weight: 600; }
+  /* Invisible: only lends its box to the dot digits (and stays readable to screen readers). */
+  #time { color: transparent; }
 </style>
 </head>
 <body>
@@ -95,41 +95,51 @@ addEventListener('keydown', e => {
 
 // --- dot grid: procedural flow field; every pulse lights all dots, then flow resumes ---
 let W, H, cols, rows, mask, maskKey = '';
-const mk = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
 
+// Dot-matrix digits: classic 5×7 glyphs, each lit pixel drawn as a K×K block of dots, so every
+// stroke is exactly K dots wide on any screen (a vector font rasterised this coarse came out
+// with ragged, half-lit strokes). "M:SS" = 3 digits + colon + 3 one-pixel gaps.
+const FONT = {
+  0: ['.XXX.', 'X...X', 'X...X', 'X...X', 'X...X', 'X...X', '.XXX.'],
+  1: ['..X..', '.XX..', '..X..', '..X..', '..X..', '..X..', '.XXX.'],
+  2: ['.XXX.', 'X...X', '....X', '...X.', '..X..', '.X...', 'XXXXX'],
+  3: ['XXXXX', '...X.', '..X..', '...X.', '....X', 'X...X', '.XXX.'],
+  4: ['...X.', '..XX.', '.X.X.', 'X..X.', 'XXXXX', '...X.', '...X.'],
+  5: ['XXXXX', 'X....', 'XXXX.', '....X', '....X', 'X...X', '.XXX.'],
+  6: ['..XX.', '.X...', 'X....', 'XXXX.', 'X...X', 'X...X', '.XXX.'],
+  7: ['XXXXX', '....X', '...X.', '..X..', '.X...', '.X...', '.X...'],
+  8: ['.XXX.', 'X...X', 'X...X', '.XXX.', 'X...X', 'X...X', '.XXX.'],
+  9: ['.XXX.', 'X...X', 'X...X', '.XXXX', '....X', '...X.', '.XX..'],
+  ':': ['.', '.', 'X', '.', 'X', '.', '.'],
+};
+const K = 2, TEXT_W = (3 * 5 + 1 + 3) * K, TEXT_H = 7 * K;
+
+// The grid is sized from the digits' box (safe area, minus a margin), so the digits fill it the
+// same way on every screen and orientation; the dots then tile the whole screen at that pitch.
 function resize() {
-  const dpr = devicePixelRatio || 1, r = cv.getBoundingClientRect();
+  const dpr = devicePixelRatio || 1, r = cv.getBoundingClientRect(), b = timeEl.getBoundingClientRect();
   W = cv.width = Math.round(r.width * dpr); H = cv.height = Math.round(r.height * dpr);
-  const pitch = Math.min(r.width, r.height) / 18;       // the grid follows the screen: 18 dots on the short side
+  const pitch = Math.min(b.width / (TEXT_W + 4), b.height / (TEXT_H + 3));
   cols = Math.max(1, Math.round(r.width / pitch)); rows = Math.max(1, Math.round(r.height / pitch));
   maskKey = '';
 }
 addEventListener('resize', resize); resize();
 
-// Rasterise the digits at SS×SS pixels per dot and average each block: `mask` then holds how much
-// of every dot's cell the glyphs cover (0..1). Drawing text at one pixel per dot came out uneven
-// on iOS, hence the supersampling. Digits get fixed-width slots so nothing jiggles.
-const SS = 6;
+// mask[dot] = 1 where a digit is, centred on the digits' box.
 function buildMask(key) {
-  const txt = timeEl.textContent, mw = cols * SS, mh = rows * SS;
-  const r = cv.getBoundingClientRect(), t = timeEl.getBoundingClientRect(), cs = getComputedStyle(timeEl);
-  mk.canvas.width = mw; mk.canvas.height = mh;
-  mk.setTransform(mw / r.width, 0, 0, mh / r.height, 0, 0);   // draw in CSS px
-  mk.font = `${cs.fontWeight} 100px ${cs.fontFamily}`;
-  const dw = Math.max(...[...'0123456789'].map(d => mk.measureText(d).width));
-  const colon = mk.measureText(':').width, cap = mk.measureText('0').actualBoundingBoxAscent;
-  const slot = c => c === ':' ? colon : dw;
-  const w = [...txt].reduce((a, c) => a + slot(c), 0);
-  const s = Math.min(t.width * 0.9 / w, t.height * 0.85 / cap);
-  mk.font = `${cs.fontWeight} ${100 * s}px ${cs.fontFamily}`;
-  mk.textAlign = 'center';
-  let x = t.left - r.left + (t.width - w * s) / 2;
-  const y = t.top - r.top + (t.height + cap * s) / 2;
-  for (const c of txt) { mk.fillText(c, x + slot(c) * s / 2, y); x += slot(c) * s; }
-  const px = mk.getImageData(0, 0, mw, mh).data;
+  const txt = timeEl.textContent, r = cv.getBoundingClientRect(), b = timeEl.getBoundingClientRect();
   mask = new Float32Array(cols * rows);
-  for (let y = 0; y < mh; y++) for (let x = 0; x < mw; x++)
-    mask[(y / SS | 0) * cols + (x / SS | 0)] += px[(y * mw + x) * 4 + 3] / (255 * SS * SS);
+  let x = Math.round((b.left + b.width / 2 - r.left) * cols / r.width - TEXT_W / 2);
+  const y = Math.round((b.top + b.height / 2 - r.top) * rows / r.height - TEXT_H / 2);
+  for (const c of txt) {
+    FONT[c].forEach((line, gy) => [...line].forEach((p, gx) => {
+      if (p === 'X') for (let dy = 0; dy < K; dy++) for (let dx = 0; dx < K; dx++) {
+        const i = x + gx * K + dx, j = y + gy * K + dy;
+        if (i >= 0 && i < cols && j >= 0 && j < rows) mask[j * cols + i] = 1;
+      }
+    }));
+    x += (FONT[c][0].length + 1) * K;
+  }
   maskKey = key;
 }
 
@@ -236,7 +246,7 @@ function frame(now) {
       if ((m > 0.2) !== digit) continue;
       let f = 0;
       for (const [fn, w] of mix) f += w * fn(i, j, t, idx);
-      // digits flow between 70% and full (scaled by glyph coverage), the rest flows dim
+      // digits flow between 70% and full, the rest flows dim
       const v = digit ? m * (0.7 + 0.3 * f) : 0.5 * f;
       // digit hue sweeps the whole spectrum: a full turn every 60 s, a rainbow drift across
       // the screen, and the flow field bending it locally
